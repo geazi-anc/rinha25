@@ -23,7 +23,7 @@ final case class RequestResponseDetail(request: RequestDetail, response: Respons
 //nome das variáveis curtos para economizar bytes na string json gerada quando enviar ao valkey
 final case class Member(c: String, r: Long, a: Double)
 
-final case class ProcessorSummary(totalRequest: Int, totalAmount: Double)
+final case class ProcessorSummary(totalRequests: Int, totalAmount: Double)
 
 final case class PaymentSummary(default: ProcessorSummary, fallback: ProcessorSummary)
 

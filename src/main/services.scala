@@ -126,9 +126,9 @@ object ValkeyClientLive:
       .config[AppConfig]
       .flatMap: appConfig =>
         val config = JedisPoolConfig()
-        config.setMaxTotal(64);
-        config.setMaxIdle(64)
-        config.setMinIdle(32)
+        config.setMaxTotal(32);
+        config.setMaxIdle(32)
+        config.setMinIdle(16)
         config.setMaxWait(java.time.Duration.ofMillis(500))
 
         ZIO.attemptBlocking(JedisPool(config, appConfig.valkeyHost, appConfig.valkeyPort))
