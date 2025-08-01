@@ -8,25 +8,23 @@ import zio.http.codec.*
 import zio.http.endpoint.*
 import zio.schema.*
 
-object Main extends ZIOAppDefault:
-  override val bootstrap = Runtime.removeDefaultLoggers >>> logger
+object Backend extends ZIOAppDefault:
+  override val bootstrap = Runtime.disableFlags(RuntimeFlag.FiberRoots) >>> Runtime.removeDefaultLoggers >>> logger
 
-  def consumer(q: Queue[Transaction]): ZIO[PaymentService, String, Unit] = for
-    transaction <- q.take
-    payment = Payment.from(transaction)
-    ps <- ZIO.service[PaymentService]
-    _  <- ps.sendToProcessorAndDb(payment)
+  def consumer(q: Queue[Payment]) = for
+    vs      <- ZIO.service[ValkeyService]
+    payment <- q.take
+    _       <- vs.rpushPayment("payments:all", payment).logError("deu ruim")
   yield ()
 
-
   // routes
-  def routes(transactions: Queue[Transaction]) =
+  def routes(payments: Queue[Payment]) =
     val paymentsRoute = Endpoint(RoutePattern.POST / "payments")
       .in[Transaction]
       .out[Unit]
       .outError[String](Status.InternalServerError)
       .implement { transaction =>
-        transactions.offer(transaction).unit
+        payments.offer(Payment.from(transaction)).unit
       }
 
     val paymentsSummaryRoute = Endpoint(RoutePattern.GET / "payments-summary")
@@ -41,9 +39,9 @@ object Main extends ZIOAppDefault:
     Routes(paymentsRoute, paymentsSummaryRoute)
 
   val app = for
-    transactions <- Queue.unbounded[Transaction]
-    _            <- consumer(transactions).schedule(Schedule.spaced(1.millis)).forkDaemon
-    server       <- Server.serve(routes(transactions))
+    payments <- Queue.unbounded[Payment]
+    _        <- consumer(payments).schedule(Schedule.spaced(1.millis)).forkDaemon
+    server   <- Server.serve(routes(payments))
   yield ()
 
   val run = app.provide(
@@ -51,5 +49,4 @@ object Main extends ZIOAppDefault:
     PaymentService.live,
     ValkeyClientLive.live,
     ValkeyService.live,
-    PaymentProcessorManager.live,
   )

@@ -13,8 +13,7 @@ import zio.json.*
 import java.time.Instant
 import scala.jdk.CollectionConverters.*
 
-
-class PaymentService(valkeyService: ValkeyService, paymentProcessorManager: PaymentProcessorManager):
+class PaymentService(valkeyService: ValkeyService):
   def addPayment(payment: Payment, processor: Processor): IO[String, RequestResponseDetail] =
     val requestDetail = RequestDetail(payment, processor)
 
@@ -24,8 +23,11 @@ class PaymentService(valkeyService: ValkeyService, paymentProcessorManager: Paym
       .map(responseDetail => RequestResponseDetail(requestDetail, responseDetail))
       .mapError(e => e.toString)
 
-  def sendToProcessor(payment: Payment): IO[String, RequestResponseDetail] = for
-    ppm <- ZIO.succeed(paymentProcessorManager)
+  def sendToProcessor(
+    payment: Payment,
+    paymentProcessorManager: Ref[PaymentProcessorManager],
+  ): IO[String, RequestResponseDetail] = for
+    ppm <- paymentProcessorManager.get
     pr1 = ZIO.log(s"= Send payment to ${ppm.primary.id}") *> addPayment(payment, ppm.primary)
     pr2 = pr1.filterOrFail(_.response.statusCode.isSuccess)("Payment processor is unavailable")
     sr1 = pr2.orElse(ZIO.log(s"Send payment to ${ppm.secundary.id}") *> addPayment(payment, ppm.secundary))
@@ -40,12 +42,13 @@ class PaymentService(valkeyService: ValkeyService, paymentProcessorManager: Paym
   yield r1
   end sendToProcessor
 
-  def sendToProcessorAndDb(payment: Payment): IO[String, Unit] = for
-    detail  <- sendToProcessor(payment)
-    _       <- ZIO.log(s"Payment ${payment.correlationId} has been successfully sent to ${detail.request.processor.id}")
-    detail2 <- valkeyService.zaddPayment(payment, detail.request.processor.id)
-    _       <- ZIO.log(s"Payment ${payment.correlationId} has been successfully sent to valkey")
-  yield ()
+  def sendToProcessorAndDb(payment: Payment, paymentProcessorManager: Ref[PaymentProcessorManager]): IO[String, Unit] =
+    for
+      detail <- sendToProcessor(payment, paymentProcessorManager)
+      _ <- ZIO.log(s"Payment ${payment.correlationId} has been successfully sent to ${detail.request.processor.id}")
+      detail2 <- valkeyService.zaddPayment(payment, detail.request.processor.id)
+      _       <- ZIO.log(s"Payment ${payment.correlationId} has been successfully sent to valkey")
+    yield ()
 
   def summary(from: String, to: String): IO[String, PaymentSummary] = (
     for
@@ -74,6 +77,31 @@ end PaymentService
 
 class ValkeyService(valkeyClient: JedisPool):
   private val client = valkeyClient
+
+  def rpushPayment(key: String, payment: Payment): IO[String, Unit] =
+    ZIO
+      .attempt(client.getResource())
+      .flatMap(client =>
+        ZIO
+          .attemptBlocking(client.rpush(key, payment.toJson))
+          .map(_ => client.close())
+          .onError(_ => ZIO.succeed(client.close())),
+      )
+      .mapError(e => e.toString)
+
+  def lpopPayments(key: String, count: Int): IO[String, Chunk[Payment]] =
+    ZIO
+      .attempt(client.getResource())
+      .flatMap(client =>
+        ZIO
+          .attemptBlocking(client.lpop(key, count))
+          .map(ps => { client.close(); ps })
+          .onError(_ => ZIO.succeed(client.close())),
+      )
+      .map(ps => Chunk.fromIterable(if ps == null then List.empty[String] else ps.asScala))
+      .map(ps => ps.map(p => ZIO.fromEither(p.fromJson[Payment])))
+      .flatMap(ps => ZIO.collectAll(ps))
+      .mapError(e => e.toString)
 
   def zaddPayment(payment: Payment, processorId: String): IO[String, Unit] = ZIO
     .attempt(client.getResource())
@@ -132,3 +160,36 @@ object ValkeyClientLive:
         config.setMaxWait(java.time.Duration.ofMillis(500))
 
         ZIO.attemptBlocking(JedisPool(config, appConfig.valkeyHost, appConfig.valkeyPort))
+
+object PaymentProcessorService:
+
+  def checkHealthOf(processor: Processor): IO[String, HealthStatus] =
+    HttpClientZioBackend()
+      .flatMap(backend =>
+        basicRequest
+          .get(processor.url.addPath("payments", "service-health"))
+          .response(asJson[HealthResponse])
+          .send(backend),
+      )
+      .flatMap(r => ZIO.fromEither(r.body))
+      .flatMap(hr => ZIO.succeed(HealthStatus(processor, hr.failing, hr.minResponseTime)))
+      .mapError(e => e.toString)
+
+  def choice(ph: HealthStatus, sh: HealthStatus): UIO[Processor] = ZIO.succeed:
+    if ph.failing && !sh.failing then sh.processor
+    else if sh.failing && !ph.failing then ph.processor
+    else if ph.failing == sh.failing && ph.minResponseTime == sh.minResponseTime then
+      if ph.processor.id == "default" then ph.processor else sh.processor
+    else if ph.failing == sh.failing && ph.minResponseTime < sh.minResponseTime then ph.processor
+    else sh.processor
+
+  def monitor(paymentProcessorManager: Ref[PaymentProcessorManager]): IO[String, Unit] =
+    for
+      ppm                 <- paymentProcessorManager.get
+      _                   <- ZIO.log(s"primary = ${ppm.primary.id}")
+      primaryHealth       <- checkHealthOf(ppm.primary)
+      secundaryHealth     <- checkHealthOf(ppm.secundary)
+      newPrimaryProcessor <- choice(primaryHealth, secundaryHealth)
+      _                   <- paymentProcessorManager.update(ppm => ppm.setPrimary(newPrimaryProcessor))
+      _                   <- ZIO.log(s"new primary = ${newPrimaryProcessor.id}")
+    yield ()
